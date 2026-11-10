@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Warranty Claim QA</title>
+<style>
+  body { font: 15px/1.45 system-ui, sans-serif; margin: 20px; color: #1f2937; background: #fafafa; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 22px 0 8px; }
+  .sub { color: #6b7280; margin: 0 0 16px; }
+  .card { background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  label { font-weight: 600; }
+  input[type=text] { padding: 8px 10px; border: 1px solid #9ca3af; border-radius: 6px; font: inherit; min-width: 220px; }
+  button { padding: 9px 14px; border-radius: 6px; border: 1px solid #6b7280; background: #fff; font: inherit; cursor: pointer; }
+  button.primary { background: #3f51b5; color: #fff; border-color: #3f51b5; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { font-weight: 600; }
+  .pass { color: #047857; } .fail { color: #b91c1c; } .info { color: #1d4ed8; }
+  table { border-collapse: collapse; width: 100%; }
+  td { border-top: 1px solid #e5e7eb; padding: 6px 8px; vertical-align: top; }
+  td:first-child { width: 42%; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f4f6; border: 1px solid #d1d5db; padding: 12px; border-radius: 6px; margin: 0; font-size: 13px; }
+  details summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h1>Warranty Claim</h1>
+<p class="sub">QA page for PROD-3795 (custom app, no Header) and PROD-3794 (source URL). Api values are redacted.</p>
+<p id="status">Waiting for host handshake…</p>
+
+<div class="card">
+  <div class="row">
+    <label for="claim">Claim number</label>
+    <input id="claim" type="text" disabled>
+    <span id="claimNote" class="sub" style="margin:0"></span>
+  </div>
+  <div class="row" style="margin-top:14px">
+    <button id="finalize" type="button" class="primary" disabled>Finalize</button>
+    <button id="incomplete" type="button" disabled>Save as incomplete</button>
+    <button id="cancel" type="button" disabled>Cancel and return to chat</button>
+  </div>
+</div>
+
+<h2>Checks</h2>
+<div class="card"><table id="checks"><tbody></tbody></table></div>
+
+<h2>Messages sent to host</h2>
+<div class="card"><pre id="sent">(none yet)</pre></div>
+
+<h2>Raw context</h2>
+<div class="card">
+  <details open><summary>TransactionData</summary><pre id="txData"></pre></details>
+  <details><summary>AppSettings</summary><pre id="appSettings"></pre></details>
+  <details><summary>Api summary (values redacted)</summary><pre id="apiSummary"></pre></details>
+  <details><summary>Other top-level keys</summary><pre id="otherKeys"></pre></details>
+  <details><summary>Page URL query parameters (PROD-3794)</summary><pre id="query"></pre></details>
+</div>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status");
+const claimInput = $("claim");
+const actionButtons = [$("finalize"), $("incomplete"), $("cancel")];
+const sentLog = [];
+
+let expectedHostOrigin = null;
+let port = null;
+let transactionData = null;
+
+// ---- PROD-3794: show how the source URL's query string arrived ----
+const params = new URLSearchParams(location.search);
+const queryView = {};
+for (const [k, v] of params) queryView[k] = v;
+$("query").textContent = JSON.stringify({ rawSearch: location.search, parsed: queryView }, null, 2);
+
+try {
+  expectedHostOrigin = new URL(params.get("host")).origin;
+} catch {
+  setStatus("fail", "Configuration error: add ?host=<URL-encoded portal origin> to the Cloud UI Source.");
+}
+
+function setStatus(kind, text) {
+  statusEl.className = kind;
+  statusEl.textContent = text;
+}
+
+function addCheck(kind, label, detail) {
+  const tr = document.createElement("tr");
+  const a = document.createElement("td");
+  const b = document.createElement("td");
+  a.textContent = label;
+  b.className = kind;
+  b.textContent = (kind === "pass" ? "PASS" : kind === "fail" ? "FAIL" : "INFO") + (detail ? " — " + detail : "");
+  tr.append(a, b);
+  $("checks").tBodies[0].append(tr);
+}
+
+function send(subject, data = {}) {
+  if (!port) return;
+  const message = {
+    id: crypto.randomUUID(),
+    time: Date.now(),
+    subject,
+    source: "warranty-claim-qa",
+    specVersion: "1.0",
+    type: "object",
+    dataContentType: "application/json",
+    data
+  };
+  port.postMessage(message);
+  sentLog.push({ at: new Date().toISOString(), subject, data });
+  $("sent").textContent = JSON.stringify(sentLog, null, 2);
+}
+
+function buildPayload() {
+  // Send the whole transaction back with the (possibly edited) claim number.
+  const base = transactionData && typeof transactionData === "object" && !Array.isArray(transactionData)
+    ? transactionData : {};
+  return Object.assign({}, base, { ClaimNumber: claimInput.value.trim() });
+}
+
+function runChecks(context) {
+  const td = context.TransactionData;
+  const isObj = td !== null && typeof td === "object" && !Array.isArray(td);
+
+  addCheck(isObj ? "pass" : "fail", "TransactionData is a JSON object", isObj ? "" : "got " + JSON.stringify(td));
+  if (!isObj) return;
+
+  addCheck(!("Header" in td) ? "pass" : "info", "No Header key in TransactionData",
+    "Header" in td ? "Header present: " + JSON.stringify(td.Header) + " (expected only in HP-4 / N-tests)" : "");
+
+  const hasClaim = typeof td.ClaimNumber === "string" && td.ClaimNumber.length > 0;
+  addCheck(hasClaim ? "pass" : "fail", "ClaimNumber present", hasClaim ? td.ClaimNumber : "missing");
+
+  addCheck(td.ClaimNumber === "WC-7" ? "info" : "pass", "Claim came from the tool argument",
+    td.ClaimNumber === "WC-7" ? "WC-7 is the script fallback — the claim argument was empty or not passed" : "");
+
+  const extra = Object.keys(td).filter(k => k !== "ClaimNumber");
+  addCheck(extra.length === 0 ? "pass" : "info", "No extra keys injected into TransactionData",
+    extra.length ? "extra keys: " + extra.join(", ") : "");
+
+  const salesDocKeys = ["Mode", "SalesDocumentType", "VcSettings", "SalesDocSettings"].filter(k => k in td);
+  addCheck(salesDocKeys.length === 0 ? "pass" : "fail", "No Sales Doc / VC keys at top level",
+    salesDocKeys.length ? salesDocKeys.join(", ") : "");
+
+  addCheck("ContextId" in context ? "pass" : "info", "ContextId in context",
+    "ContextId" in context ? String(context.ContextId) : "not sent (confirm with dev whether link apps should get it)");
+
+  const settings = context.AppSettings;
+  addCheck(settings && typeof settings === "object" ? "pass" : "fail", "AppSettings received",
+    settings && settings.qaMarker ? "qaMarker = " + settings.qaMarker : "");
+}
+
+window.addEventListener("message", event => {
+  if (!expectedHostOrigin || port) return;
+  if (event.source !== window.parent) return;
+  if (event.origin !== expectedHostOrigin) return;
+  if (event.data !== "iframeReady:cloud-ui:host") return;
+  if (!event.ports || !event.ports[0]) return;
+
+  port = event.ports[0];
+
+  port.onmessage = messageEvent => {
+    const message = messageEvent.data;
+    if (!message || message.subject !== "INITIAL-CONTEXT") return;
+
+    const context = message.data;
+    if (!context || typeof context !== "object" || Array.isArray(context)) {
+      setStatus("fail", "FAIL: context is not an object.");
+      return;
+    }
+
+    transactionData = context.TransactionData;
+
+    const api = context.Api;
+    $("apiSummary").textContent = JSON.stringify({
+      present: !!api && typeof api === "object",
+      baseUrlPresent: typeof api?.BaseURL === "string" && api.BaseURL.length > 0,
+      tokenPresent: typeof api?.Authorization?.Token === "string" && api.Authorization.Token.length > 0,
+      apiKeyPresent: typeof api?.ApiKey === "string" && api.ApiKey.length > 0,
+      connectionIdPresent: typeof api?.ConnectionId === "string",
+      keys: api && typeof api === "object" ? Object.keys(api) : []
+    }, null, 2);
+    $("txData").textContent = JSON.stringify(context.TransactionData, null, 2);
+    $("appSettings").textContent = JSON.stringify(context.AppSettings, null, 2);
+
+    const other = {};
+    for (const k of Object.keys(context)) {
+      if (!["Api", "TransactionData", "AppSettings"].includes(k)) other[k] = context[k];
+    }
+    $("otherKeys").textContent = Object.keys(other).length ? JSON.stringify(other, null, 2) : "(none)";
+
+    claimInput.value = transactionData && transactionData.ClaimNumber != null ? String(transactionData.ClaimNumber) : "";
+    claimInput.disabled = false;
+    $("claimNote").textContent = "Edit before Finalize to test that changes are saved.";
+
+    runChecks(context);
+    actionButtons.forEach(b => (b.disabled = false));
+    setStatus("pass", "PASS: INITIAL-CONTEXT received.");
+  };
+
+  port.start();
+  setStatus("info", "Channel connected; waiting for context…");
+  send("CHANNEL-READY");
+});
+
+claimInput.addEventListener("keydown", e => {
+  if (e.key === "Enter") { e.preventDefault(); $("finalize").click(); }
+});
+
+$("finalize").addEventListener("click", () => {
+  if (!claimInput.value.trim()) { setStatus("fail", "Enter a claim number before finalizing."); return; }
+  send("FINALIZE", buildPayload());
+  setStatus("info", "FINALIZE sent. Now check the stored transaction data — it must not be null.");
+});
+
+$("incomplete").addEventListener("click", () => {
+  send("INCOMPLETE", buildPayload());
+  setStatus("info", "INCOMPLETE sent. Now check the stored transaction data — it must not be null.");
+});
+
+$("cancel").addEventListener("click", () => send("CANCEL"));
+</script>
+</body>
+</html>
